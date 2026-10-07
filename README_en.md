@@ -371,7 +371,7 @@ New protocol:
 
 - Source: `GET /v1/workloads/{workload}/checkpoints/{checkpoint}/chunks`, returning a binary batch keyed by file + chunk range.
 - Target: `PUT /v1/migrations/{migration}/chunks`, committing multiple chunks at once.
-- `TRANSFER_BATCH_BYTES=4MiB` by default, accepting `256KiB..16MiB`.
+- `TRANSFER_BATCH_BYTES=8MiB` by default, accepting `256KiB..15MiB` (encoding needs headroom, so the configurable ceiling sits just below the 16MiB wire limit).
 - When a Target batch writes to the same file it reuses one file descriptor, and issues a single `fsync` after the whole batch completes.
 - State JSON is still persisted after the batch completes. So on crash, the latest unpersisted metadata is re-sent by the next progress/resume, which leaves the "recoverable + idempotent" semantics unchanged.
 

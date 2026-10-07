@@ -14,7 +14,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/wishforge/sluicegate/internal/common"
@@ -35,14 +34,14 @@ type TargetFile struct {
 }
 
 type TargetServer struct {
-	Root                string
-	Logger              *common.SLogger
-	Metrics             *common.Metrics
-	mu                  sync.Mutex
-	states              map[string]TargetState
-	chaosCrashAfter     int64
-	chaosChunkCount     int64
-	chaosCrashTriggered bool
+	Root            string
+	Logger          *common.SLogger
+	Metrics         *common.Metrics
+	locks           stripedTargetLock
+	stateMu         stateTableLock
+	states          map[string]TargetState
+	chaosCrashAfter int64
+	chaos           chaosCounters
 }
 
 func NewTargetServer(root string, logger *common.SLogger, metrics *common.Metrics) (*TargetServer, error) {
@@ -156,9 +155,12 @@ func (s *TargetServer) handleInit(w http.ResponseWriter, r *http.Request, id str
 		common.Error(w, 400, "INVALID_WORKLOAD", errors.New("invalid workload id"))
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	mu := s.locks.lockFor(id)
+	mu.Lock()
+	defer mu.Unlock()
+	s.stateMu.RLock()
 	st, ok := s.states[id]
+	s.stateMu.RUnlock()
 	if ok {
 		if st.WorkloadID != req.WorkloadID {
 			common.Error(w, 409, "MIGRATION_CONFLICT", errors.New("migration workload mismatch"))
@@ -198,15 +200,20 @@ func (s *TargetServer) handleInit(w http.ResponseWriter, r *http.Request, id str
 		common.Error(w, 500, "STATE_PERSIST_FAILED", err)
 		return
 	}
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
 	s.states[id] = st
 	s.Logger.Info("target_migration_initialized", "request_id", common.RequestID(r), "trace_id", common.TraceID(r), "migration_id", id, "workload_id", req.WorkloadID, "files", len(req.Files))
 	common.JSON(w, 201, st)
 }
 
 func (s *TargetServer) handleProgress(w http.ResponseWriter, r *http.Request, id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	mu := s.locks.lockFor(id)
+	mu.Lock()
+	defer mu.Unlock()
+	s.stateMu.RLock()
 	st, ok := s.states[id]
+	s.stateMu.RUnlock()
 	if !ok {
 		common.Error(w, 404, "MIGRATION_NOT_FOUND", errors.New("migration not found"))
 		return
@@ -242,12 +249,15 @@ func (s *TargetServer) handleChunkBatch(w http.ResponseWriter, r *http.Request, 
 	s.Metrics.TargetBatchRequests.Add(1)
 
 	lockStart := time.Now()
-	s.mu.Lock()
+	mu := s.locks.lockFor(id)
+	mu.Lock()
 	queueWait := time.Since(lockStart)
 	s.Metrics.TargetBatchQueueWaitMs.Add(uint64(queueWait.Milliseconds()))
-	defer s.mu.Unlock()
+	defer mu.Unlock()
 
+	s.stateMu.RLock()
 	st, ok := s.states[id]
+	s.stateMu.RUnlock()
 	if !ok {
 		common.Error(w, 404, "MIGRATION_NOT_FOUND", errors.New("migration not found"))
 		return
@@ -331,15 +341,13 @@ func (s *TargetServer) handleChunkBatch(w http.ResponseWriter, r *http.Request, 
 		storedBytes += int64(len(c.Data))
 		s.Metrics.Chunks.Add(1)
 		s.Metrics.Bytes.Add(uint64(len(c.Data)))
-		s.chaosChunkCount++
-		if s.chaosCrashAfter > 0 && !s.chaosCrashTriggered && s.chaosChunkCount >= s.chaosCrashAfter {
-			s.chaosCrashTriggered = true
+		if persisted := s.chaos.reach(s.chaosCrashAfter); persisted > 0 {
 			if syncErr := closeFiles(true); syncErr == nil {
 				_ = s.saveLocked(st)
 			} else {
 				_ = closeFiles(false)
 			}
-			s.Logger.Error("target_chaos_crash", "migration_id", id, "chunks_persisted", s.chaosChunkCount)
+			s.Logger.Error("target_chaos_crash", "migration_id", id, "chunks_persisted", persisted)
 			os.Exit(137)
 		}
 	}
@@ -402,21 +410,24 @@ func (s *TargetServer) handleChunk(w http.ResponseWriter, r *http.Request, id st
 		common.Error(w, 400, "INVALID_CHUNK", errors.New("chunk too large"))
 		return
 	}
-	s.mu.Lock()
+	mu := s.locks.lockFor(id)
+	mu.Lock()
+	s.stateMu.RLock()
 	st, ok := s.states[id]
+	s.stateMu.RUnlock()
 	if !ok {
-		s.mu.Unlock()
+		mu.Unlock()
 		common.Error(w, 404, "MIGRATION_NOT_FOUND", errors.New("migration not found"))
 		return
 	}
 	f, ok := st.Files[path]
 	if !ok {
-		s.mu.Unlock()
+		mu.Unlock()
 		common.Error(w, 404, "FILE_NOT_FOUND", errors.New("file not found in manifest"))
 		return
 	}
 	if idx >= f.Manifest.ChunkCount || offset != int64(idx)*f.Manifest.ChunkSize {
-		s.mu.Unlock()
+		mu.Unlock()
 		common.Error(w, 409, "INVALID_CHUNK", errors.New("chunk index/offset does not match manifest"))
 		return
 	}
@@ -426,11 +437,11 @@ func (s *TargetServer) handleChunk(w http.ResponseWriter, r *http.Request, id st
 		expectedSize = remaining
 	}
 	if expectedSize < 0 || chunkSize != expectedSize {
-		s.mu.Unlock()
+		mu.Unlock()
 		common.Error(w, 409, "INVALID_CHUNK", errors.New("chunk size does not match manifest"))
 		return
 	}
-	s.mu.Unlock()
+	mu.Unlock()
 	data, err := io.ReadAll(io.LimitReader(r.Body, chunkSize+1))
 	if err != nil {
 		common.Error(w, 400, "CHUNK_READ_FAILED", err)
@@ -446,9 +457,9 @@ func (s *TargetServer) handleChunk(w http.ResponseWriter, r *http.Request, id st
 		common.Error(w, 422, "CHUNK_CHECKSUM_MISMATCH", fmt.Errorf("expected %s got %s", wantSHA, gotSHA))
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.stateMu.RLock()
 	st, ok = s.states[id]
+	s.stateMu.RUnlock()
 	if !ok {
 		common.Error(w, 404, "MIGRATION_NOT_FOUND", errors.New("migration not found"))
 		return
@@ -480,19 +491,20 @@ func (s *TargetServer) handleChunk(w http.ResponseWriter, r *http.Request, id st
 	s.Metrics.Chunks.Add(1)
 	s.Metrics.Bytes.Add(uint64(len(data)))
 	s.Logger.Debug("chunk_persisted", "request_id", common.RequestID(r), "trace_id", common.TraceID(r), "migration_id", id, "path", path, "chunk_index", idx, "bytes", len(data))
-	s.chaosChunkCount++
-	if s.chaosCrashAfter > 0 && !s.chaosCrashTriggered && s.chaosChunkCount >= s.chaosCrashAfter {
-		s.chaosCrashTriggered = true
-		s.Logger.Error("target_chaos_crash", "migration_id", id, "chunks_persisted", s.chaosChunkCount)
+	if persisted := s.chaos.reach(s.chaosCrashAfter); persisted > 0 {
+		s.Logger.Error("target_chaos_crash", "migration_id", id, "chunks_persisted", persisted)
 		os.Exit(137)
 	}
 	common.JSON(w, 200, map[string]any{"status": "stored", "index": idx})
 }
 
 func (s *TargetServer) handleActivate(w http.ResponseWriter, r *http.Request, id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	mu := s.locks.lockFor(id)
+	mu.Lock()
+	defer mu.Unlock()
+	s.stateMu.RLock()
 	st, ok := s.states[id]
+	s.stateMu.RUnlock()
 	if !ok {
 		common.Error(w, 404, "MIGRATION_NOT_FOUND", errors.New("migration not found"))
 		return
@@ -547,6 +559,8 @@ func (s *TargetServer) handleActivate(w http.ResponseWriter, r *http.Request, id
 			if strings.Contains(string(b), id) {
 				st.Activated = true
 				if err := s.saveLocked(st); err == nil {
+					s.stateMu.Lock()
+					defer s.stateMu.Unlock()
 					s.states[id] = st
 				}
 				common.JSON(w, 200, map[string]any{"status": "already_activated", "workload_id": st.WorkloadID})
@@ -569,15 +583,20 @@ func (s *TargetServer) handleActivate(w http.ResponseWriter, r *http.Request, id
 		common.Error(w, 500, "STATE_PERSIST_FAILED", err)
 		return
 	}
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
 	s.states[id] = st
 	s.Logger.Info("target_activated", "request_id", common.RequestID(r), "trace_id", common.TraceID(r), "migration_id", id, "workload_id", st.WorkloadID)
 	common.JSON(w, 200, map[string]any{"status": "activated", "workload_id": st.WorkloadID})
 }
 
 func (s *TargetServer) handleCommit(w http.ResponseWriter, r *http.Request, id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	mu := s.locks.lockFor(id)
+	mu.Lock()
+	defer mu.Unlock()
+	s.stateMu.RLock()
 	st, ok := s.states[id]
+	s.stateMu.RUnlock()
 	if !ok {
 		common.Error(w, 404, "MIGRATION_NOT_FOUND", errors.New("migration not found"))
 		return
@@ -596,9 +615,12 @@ func (s *TargetServer) handleCommit(w http.ResponseWriter, r *http.Request, id s
 }
 
 func (s *TargetServer) handleRollback(w http.ResponseWriter, r *http.Request, id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	mu := s.locks.lockFor(id)
+	mu.Lock()
+	defer mu.Unlock()
+	s.stateMu.RLock()
 	st, ok := s.states[id]
+	s.stateMu.RUnlock()
 	if !ok {
 		common.JSON(w, 200, map[string]any{"status": "already_absent"})
 		return
@@ -608,6 +630,8 @@ func (s *TargetServer) handleRollback(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 	_ = os.RemoveAll(s.stagingPath(id, st.WorkloadID))
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
 	delete(s.states, id)
 	_ = os.Remove(s.statePath(id))
 	common.JSON(w, 200, map[string]any{"status": "rolled_back"})
@@ -633,6 +657,8 @@ func (s *TargetServer) load() error {
 		if err := json.Unmarshal(b, &st); err != nil {
 			return err
 		}
+		s.stateMu.Lock()
+		defer s.stateMu.Unlock()
 		s.states[st.MigrationID] = st
 	}
 	return nil

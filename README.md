@@ -368,7 +368,7 @@ pgxpool 有界连接
 新增协议：
 - Source: `GET /v1/workloads/{workload}/checkpoints/{checkpoint}/chunks`，按 file + chunk range 返回二进制 batch。
 - Target: `PUT /v1/migrations/{migration}/chunks`，一次提交多个 chunk。
-- 默认 `TRANSFER_BATCH_BYTES=4MiB`，允许 `256KiB..16MiB`。
+- 默认 `TRANSFER_BATCH_BYTES=8MiB`，允许 `256KiB..15MiB`（编码需要预留开销，故配置上限略低于 16MiB 的 wire 上限）。
 - Target batch 写入同一文件时复用一个 file descriptor，并在整个 batch 完成后执行一次 `fsync`。
 - State JSON 仍然在 batch 完成后持久化；因此 crash 时，最新未持久化 metadata 会被下一次 progress/resume 重新发送，不改变“可恢复 + 幂等”的语义。
 

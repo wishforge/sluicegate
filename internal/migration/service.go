@@ -53,7 +53,7 @@ func NewService(store Store, log *common.SLogger, metrics *common.Metrics) *Serv
 	if v := os.Getenv("TRANSFER_BATCH_BYTES"); v != "" {
 		var n int64
 		_, _ = fmt.Sscanf(v, "%d", &n)
-		if n >= 256<<10 && n <= MaxBatchBytes {
+		if n >= 256<<10 && n <= MaxConfiguredBatchBytes {
 			s.transferBatchBytes.Store(n)
 		}
 	}
